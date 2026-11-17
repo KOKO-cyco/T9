@@ -11,8 +11,11 @@
  #include "tkl_output.h"
  #include <stdarg.h>
  #include <components/log.h>
+ #include <components/shell_task.h>
  
  #define MODE_NAME  "tkl"
+ 
+ static uint8_t s_log_level_applied = 0;
  
  /**
  * @brief Output log information
@@ -29,6 +32,11 @@
 
     if (str == NULL) {
         return;
+    }
+
+    if (0 == s_log_level_applied) {
+        s_log_level_applied = 1;
+        shell_set_log_level(BK_LOG_WARN);
     }
 
     va_start(args, str);
