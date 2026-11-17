@@ -1641,13 +1641,21 @@ typedef struct {
 
 
 
-typedef enum  {
-    DISPLAY_RGB = 0,
-    DISPLAY_8080,
-    DISPLAY_QSPI,
-    DISPLAY_SPI,
-    DISPLAY_MIPI,
-} TUYA_DISPLAY_TYPE_E;
+typedef enum {
+    TUYA_DISPLAY_ROTATION_0,
+    TUYA_DISPLAY_ROTATION_90,
+    TUYA_DISPLAY_ROTATION_180,
+    TUYA_DISPLAY_ROTATION_270,
+} TUYA_DISPLAY_ROTATION_E;
+
+typedef enum {
+    TUYA_PIXEL_FMT_RGB565,
+    TUYA_PIXEL_FMT_RGB565_LE,
+    TUYA_PIXEL_FMT_RGB666,
+    TUYA_PIXEL_FMT_RGB888,
+    TUYA_PIXEL_FMT_MONOCHROME, /* binary pixel format, 1bit per pixel, 0 is black, 1 is white */
+    TUYA_PIXEL_FMT_I2,
+} TUYA_DISPLAY_PIXEL_FMT_E;
 
 typedef struct {
     TUYA_GPIO_NUM_E pin;
