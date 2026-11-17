@@ -19,6 +19,7 @@
 #include "tkl_mipi_csi.h"
 #include "tkl_mipi_dsi.h"
 #include "tkl_output.h"
+#include "tkl_semaphore.h"
 #include "tkl_system.h"
 #include "tkl_thread.h"
 
@@ -585,6 +586,199 @@ static OPERATE_RET test_mipi_task_stop(void)
     return OPRT_OK;
 }
 
+/* ---- panel frame-rate benchmark ------------------------------------------
+ * Submits the two pre-filled frames back to back: the DPU release callback
+ * posts a semaphore, the task immediately submits the next frame. Nothing is
+ * redrawn, so what is measured is how fast the panel path can actually accept
+ * and retire frames - the ceiling the UI layer sits under.
+ *
+ * The DPU only reports a frame done on the *next* promote (dpu_core_flush
+ * commits the first frame without any release, then each vsync promotes the
+ * pending frame and frees the one before it), so the loop must keep two frames
+ * in flight: prime with two submits, then wait/submit one per iteration. */
+#define MIPI_BENCH_TASK_NAME    "mipi_bench"
+#define MIPI_BENCH_TASK_STACK   (4 * 1024)
+#define MIPI_BENCH_DEFAULT_S    10U
+
+static TKL_THREAD_HANDLE s_bench_task = NULL;
+static TKL_SEM_HANDLE    s_bench_sem = NULL;
+static volatile bool     s_bench_running = false;
+static volatile uint32_t s_bench_frames = 0;
+
+static void test_mipi_bench_release(void *buffer)
+{
+    (void)buffer;
+
+    s_bench_frames++;
+    if (s_bench_sem != NULL) {
+        tkl_semaphore_post(s_bench_sem);
+    }
+}
+
+static OPERATE_RET test_mipi_bench_submit(void)
+{
+    uint8_t *frame = s_mipi_frames[s_mipi_frame_index];
+
+    s_mipi_frame_index = (uint8_t)((s_mipi_frame_index + 1U) % MIPI_TEST_FRAME_COUNT);
+
+    os_memset(&s_mipi_flush_frame, 0, sizeof(s_mipi_flush_frame));
+    s_mipi_flush_frame.buffer = frame;
+    s_mipi_flush_frame.free_cb = test_mipi_bench_release;
+
+    return tkl_mipi_dsi_flush(&s_mipi_flush_frame);
+}
+
+static void test_mipi_bench_task_main(void *arg)
+{
+    uint32_t seconds = (uint32_t)(uintptr_t)arg;
+    uint32_t start_ms = tkl_system_get_millisecond();
+    uint32_t last_ms = start_ms;
+    uint32_t last_frames = 0;
+    uint32_t best_fps = 0;
+    TKL_THREAD_HANDLE self = NULL;
+
+    while (s_bench_running) {
+        OPERATE_RET ret;
+
+        if (tkl_semaphore_wait(s_bench_sem, 1000) != OPRT_OK) {
+            tkl_log_output("bench: dpu completion timeout\r\n");
+            break;
+        }
+        if (false == s_bench_running) {
+            break;
+        }
+
+        ret = test_mipi_bench_submit();
+        if (ret != OPRT_OK) {
+            tkl_log_output("bench: flush failed %d\r\n", ret);
+            break;
+        }
+
+        uint32_t now = tkl_system_get_millisecond();
+        if (now - last_ms >= 1000U) {
+            uint32_t fps = s_bench_frames - last_frames;
+            if (fps > best_fps) {
+                best_fps = fps;
+            }
+            tkl_log_output("bench: %u fps (%u ms window)\r\n", (unsigned int)fps,
+                           (unsigned int)(now - last_ms));
+            last_frames = s_bench_frames;
+            last_ms = now;
+        }
+
+        if (seconds != 0U && (now - start_ms) >= seconds * 1000U) {
+            break;
+        }
+    }
+
+    tkl_log_output("bench done: %u frames in %u ms, best %u fps\r\n",
+                   (unsigned int)s_bench_frames,
+                   (unsigned int)(tkl_system_get_millisecond() - start_ms),
+                   (unsigned int)best_fps);
+
+    s_bench_running = false;
+    s_bench_task = NULL;
+    if (tkl_thread_get_id(&self) == OPRT_OK && self != NULL) {
+        tkl_thread_release(self);
+    }
+}
+
+static OPERATE_RET test_mipi_bench_stop(void)
+{
+    uint32_t wait_ms = 0;
+
+    if (false == s_bench_running) {
+        return OPRT_OK;
+    }
+
+    s_bench_running = false;
+    if (s_bench_sem != NULL) {
+        tkl_semaphore_post(s_bench_sem);
+    }
+
+    while (s_bench_task != NULL) {
+        if (wait_ms >= 3000U) {
+            tkl_log_output("bench stop timeout\r\n");
+            return OPRT_TIMEOUT;
+        }
+        tkl_system_sleep(10);
+        wait_ms += 10U;
+    }
+
+    return OPRT_OK;
+}
+
+static OPERATE_RET test_mipi_bench_start(uint32_t seconds)
+{
+    OPERATE_RET ret;
+
+    if (s_mipi_lcd_opened != true) {
+        tkl_log_output("mipi lcd is not open\r\n");
+        return OPRT_RESOURCE_NOT_READY;
+    }
+
+    if (s_mipi_frame_size == 0U || s_mipi_frames[0] == NULL) {
+        ret = test_mipi_frame_buffers_prepare();
+        if (ret != OPRT_OK) {
+            tkl_log_output("prepare frame buffers failed: %d\r\n", ret);
+            return ret;
+        }
+    }
+
+    if (s_mipi_task_running == true) {
+        ret = test_mipi_task_stop();
+        if (ret != OPRT_OK) {
+            return ret;
+        }
+    }
+
+    if (s_bench_running == true) {
+        tkl_log_output("bench already running\r\n");
+        return OPRT_OK;
+    }
+
+    /* Fill once: the benchmark must not spend CPU redrawing the frames. */
+    test_mipi_fill_frame_rgb565(s_mipi_frames[0], s_mipi_frame_size, 0x001F001FU);
+    test_mipi_fill_frame_rgb565(s_mipi_frames[1], s_mipi_frame_size, 0x0000F800U);
+
+    ret = tkl_semaphore_create_init(&s_bench_sem, 0, 4);
+    if (ret != OPRT_OK) {
+        tkl_log_output("create bench semaphore failed: %d\r\n", ret);
+        return ret;
+    }
+
+    s_bench_frames = 0;
+    s_mipi_frame_index = 0;
+    s_bench_running = true;
+
+    /* Keep two frames in flight: the first submit only commits, the release for
+     * it arrives when the second frame is promoted. */
+    ret = test_mipi_bench_submit();
+    if (ret == OPRT_OK) {
+        ret = test_mipi_bench_submit();
+    }
+    if (ret != OPRT_OK) {
+        s_bench_running = false;
+        tkl_log_output("bench: prime flush failed %d\r\n", ret);
+        return ret;
+    }
+
+    ret = tkl_thread_create(&s_bench_task,
+                            MIPI_BENCH_TASK_NAME,
+                            MIPI_BENCH_TASK_STACK,
+                            TKL_THREAD_PRI_ABOVE_NORMAL,
+                            test_mipi_bench_task_main,
+                            (void *)(uintptr_t)(seconds == 0U ? MIPI_BENCH_DEFAULT_S : seconds));
+    if (ret != OPRT_OK) {
+        s_bench_running = false;
+        tkl_log_output("create bench task failed: %d\r\n", ret);
+        return ret;
+    }
+
+    tkl_log_output("bench started, %u s\r\n", (unsigned int)(seconds == 0U ? MIPI_BENCH_DEFAULT_S : seconds));
+    return OPRT_OK;
+}
+
 static OPERATE_RET test_mipi_update_geometry(void)
 {
     if (s_mipi_base_cfg.width == 0U || s_mipi_base_cfg.height == 0U) {
@@ -913,6 +1107,11 @@ static OPERATE_RET test_mipi_lcd_stop_flush(void)
         return OPRT_RESOURCE_NOT_READY;
     }
 
+    if (s_bench_running == true) {
+        tkl_log_output( "bench stopped\r\n");
+        return test_mipi_bench_stop();
+    }
+
     if (s_mipi_task_running != true && s_mipi_task == NULL) {
         tkl_log_output( "%s refresh already stopped\r\n", test_mipi_flush_mode_name());
         s_mipi_flush_mode = TEST_MIPI_FLUSH_MODE_NONE;
@@ -1200,7 +1399,7 @@ void cli_tuya_mipi_dsi_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, c
     if (argc < 2) {
         snprintf(pcWriteBuffer, xWriteBufferLen,
                  "Usage: xmipi dsi <open [panel]|open_gpu [panel] [compress]|flush [RGB]|paste [w] [h]|"
-                 "pattern [0|1]|stop_flush|close>");
+                 "pattern [0|1]|bench [seconds]|stop_flush|close>");
         return;
     }
 
@@ -1281,6 +1480,16 @@ void cli_tuya_mipi_dsi_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, c
         ret = test_mipi_lcd_pattern(enable);
         snprintf(pcWriteBuffer, xWriteBufferLen,
                  "xmipi dsi pattern %s (%d)\r\n", (ret == OPRT_OK) ? "ok" : "failed", ret);
+    } else if (os_strcmp(cmd, "bench") == 0) {
+        uint32_t seconds = 0U;
+
+        if (argc >= 3) {
+            seconds = (uint32_t)os_strtoul(argv[2], NULL, 10);
+        }
+
+        ret = test_mipi_bench_start(seconds);
+        snprintf(pcWriteBuffer, xWriteBufferLen,
+                 "xmipi dsi bench %s (%d)\r\n", (ret == OPRT_OK) ? "ok" : "failed", ret);
     } else if (os_strcmp(cmd, "close") == 0) {
         ret = test_mipi_lcd_close();
         snprintf(pcWriteBuffer, xWriteBufferLen,
@@ -1288,6 +1497,6 @@ void cli_tuya_mipi_dsi_cmd(char *pcWriteBuffer, int xWriteBufferLen, int argc, c
     } else {
         snprintf(pcWriteBuffer, xWriteBufferLen,
                  "Usage: xmipi dsi <open [panel]|open_gpu [panel] [compress]|flush [RGB]|paste [w] [h]|"
-                 "pattern [0|1]|stop_flush|close>");
+                 "pattern [0|1]|bench [seconds]|stop_flush|close>");
     }
 }

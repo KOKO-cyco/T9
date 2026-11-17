@@ -7,10 +7,12 @@
 #if (CONFIG_LVGL && CONFIG_LVGL_V9)
 
 #define TUYA_LVGL_STRESS_TIME_STEP_MS   50U
+#define TUYA_LVGL_STRESS_FULL_REFR_MS   16U
 #define TUYA_LVGL_STRESS_LIST_ITEMS     6U
 #define TUYA_LVGL_STRESS_STATUS_HEIGHT  48
 
 static lv_timer_t *s_stress_timer;
+static lv_timer_t *s_full_refr_timer;
 static lv_obj_t *s_root_page;
 static lv_obj_t *s_dynamic_layer;
 static lv_obj_t *s_status_label;
@@ -542,6 +544,16 @@ static void stress_timer_cb(lv_timer_t *timer)
     stress_status_update();
 }
 
+/* Keep the whole screen dirty so every refresh carries a full frame. Without
+ * this the demo only redraws the small areas its animations touch, which is not
+ * comparable with a full-screen UI refresh. */
+static void stress_full_refr_cb(lv_timer_t *timer)
+{
+    (void)timer;
+
+    lv_obj_invalidate(lv_screen_active());
+}
+
 void tuya_lvgl_stress_create(void)
 {
     if (s_stress_timer != NULL) {
@@ -555,12 +567,17 @@ void tuya_lvgl_stress_create(void)
     stress_status_update();
     tkl_log_output("lvgl stress start\r\n");
     s_stress_timer = lv_timer_create(stress_timer_cb, TUYA_LVGL_STRESS_TIME_STEP_MS, NULL);
+    s_full_refr_timer = lv_timer_create(stress_full_refr_cb, TUYA_LVGL_STRESS_FULL_REFR_MS, NULL);
 }
 
 void tuya_lvgl_stress_pause(void)
 {
     if (s_stress_timer != NULL) {
         lv_timer_pause(s_stress_timer);
+    }
+
+    if (s_full_refr_timer != NULL) {
+        lv_timer_pause(s_full_refr_timer);
     }
 }
 
@@ -569,6 +586,10 @@ void tuya_lvgl_stress_resume(void)
     if (s_stress_timer != NULL) {
         lv_timer_resume(s_stress_timer);
     }
+
+    if (s_full_refr_timer != NULL) {
+        lv_timer_resume(s_full_refr_timer);
+    }
 }
 
 void tuya_lvgl_stress_destroy(void)
@@ -576,6 +597,11 @@ void tuya_lvgl_stress_destroy(void)
     if (s_stress_timer != NULL) {
         lv_timer_delete(s_stress_timer);
         s_stress_timer = NULL;
+    }
+
+    if (s_full_refr_timer != NULL) {
+        lv_timer_delete(s_full_refr_timer);
+        s_full_refr_timer = NULL;
     }
 
     stress_screen_destroy();

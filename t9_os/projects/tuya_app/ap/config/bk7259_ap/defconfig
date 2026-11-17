@@ -251,12 +251,12 @@ CONFIG_FRAME_BUFFER=y
 CONFIG_VG_LITE_GPU=y
 
 # lvgl
-CONFIG_LVGL=y
-CONFIG_LVGL_V9=y
-CONFIG_LVGL_TASK_PRIORITY=4
-CONFIG_LVGL_TASK_STACK_SIZE=8192
-CONFIG_LVGL_FRAME_BUFFER_NUM=2
-CONFIG_LVGL_GPU_ROTATE_ENABLE=y
+# EXPERIMENT: this build uses the BK component's LVGL as the reference path for
+# the xlvgl demo. src/liblvgl (TuyaOpen LVGL) must then stay disabled in the
+# application, otherwise two LVGL copies with different lv_vendor_init()
+# signatures end up in the same image.
+CONFIG_LVGL=n
+CONFIG_LVGL_V9=n
 CONFIG_LV_USE_DRAW_VG_LITE=n
 
 # peripheral
